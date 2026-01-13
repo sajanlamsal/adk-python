@@ -70,6 +70,96 @@ DEFAULT_TASK_COMPLETION_DELAY = 1.0
 DEFAULT_ENABLE_CACHE_STATISTICS = False
 
 
+def _should_stop_afc_loop(
+    llm_request: LlmRequest,
+    invocation_context: InvocationContext,
+    last_event: Optional[Event],
+    count_current_event: bool = False,
+) -> bool:
+  """Check if the AFC loop should stop based on configuration.
+
+  Args:
+    llm_request: The LLM request containing the config.
+    invocation_context: The invocation context with session history.
+    last_event: The last event from the current step.
+    count_current_event: If True, include the current event in the count.
+      This is used when checking before executing function calls.
+
+  Returns:
+    True if AFC loop should stop, False otherwise.
+
+  Important behavioral differences based on count_current_event:
+
+  When count_current_event=False (loop continuation check):
+    - Only checks the disable flag
+    - Does NOT enforce maximum_remote_calls limit
+    - Returns True only if AFC is explicitly disabled
+    - Used in run_async() loop to decide if loop should continue
+
+  When count_current_event=True (pre-execution check):
+    - Checks BOTH disable flag AND maximum_remote_calls limit
+    - Returns True if either condition is met
+    - Used before executing function calls to prevent execution when disabled/limited
+
+  Event Counting Semantics:
+    maximum_remote_calls counts LLM response events containing function calls,
+    NOT individual function executions. An event with multiple parallel function
+    calls counts as 1 toward the limit, not N.
+  """
+  # Check if AFC is explicitly disabled
+  if (
+      llm_request.config
+      and llm_request.config.automatic_function_calling
+      and llm_request.config.automatic_function_calling.disable
+  ):
+    logger.warning('automatic_function_calling is disabled. Stopping AFC loop.')
+    return True
+
+  # Check maximum_remote_calls limit
+  if (
+      llm_request.config
+      and llm_request.config.automatic_function_calling
+      and llm_request.config.automatic_function_calling.maximum_remote_calls
+      is not None
+  ):
+    max_calls = (
+        llm_request.config.automatic_function_calling.maximum_remote_calls
+    )
+    if max_calls <= 0:
+      logger.warning(
+          'max_remote_calls in automatic_function_calling_config %s is less'
+          ' than or equal to 0. Disabling automatic function calling.',
+          max_calls,
+      )
+      return True
+
+    # Count function call events in current invocation
+    events = invocation_context._get_events(
+        current_invocation=True, current_branch=True
+    )
+    function_call_count = sum(1 for e in events if e.get_function_calls())
+
+    # When checking before execution (count_current_event=True):
+    # The current event is already in the session, so function_call_count
+    # includes it. Check if the count exceeds the limit.
+    if count_current_event:
+      if last_event and last_event.get_function_calls():
+        # Check if we've exceeded the limit (current event is already counted)
+        if function_call_count > max_calls:
+          logger.warning(
+              'Would exceed maximum_remote_calls limit of %s. Not executing'
+              ' function calls.',
+              max_calls,
+          )
+          return True
+    # When checking in the run loop (count_current_event=False):
+    # Don't stop the loop just because we've reached the limit.
+    # We need to continue to get a final response from the LLM.
+    # The check before execution (above) will prevent executing more FCs.
+
+  return False
+
+
 class BaseLlmFlow(ABC):
   """A basic flow that calls the LLM in a loop until a final response is generated.
 
@@ -359,15 +449,38 @@ class BaseLlmFlow(ABC):
       self, invocation_context: InvocationContext
   ) -> AsyncGenerator[Event, None]:
     """Runs the flow."""
+    llm_request = None
     while True:
       last_event = None
       async with Aclosing(self._run_one_step_async(invocation_context)) as agen:
         async for event in agen:
           last_event = event
           yield event
+
+      # Break if there's no event or it's a final response
       if not last_event or last_event.is_final_response() or last_event.partial:
         if last_event and last_event.partial:
           logger.warning('The last event is partial, which is not expected.')
+        break
+
+      # Get the llm_request from the last step to check AFC config
+      # We reconstruct it here because the actual LlmRequest is built inside
+      # _run_one_step_async and not accessible in the loop. This reconstruction
+      # is lightweight as we only need the config fields for AFC checks.
+      # The config is guaranteed to match the agent's config since that's how
+      # it's built in the basic.py processor.
+      if llm_request is None:
+        llm_request = LlmRequest()
+        # Copy config from agent (same as in basic.py processor)
+        agent = invocation_context.agent
+        llm_request.config = (
+            agent.generate_content_config.model_copy(deep=True)
+            if agent.generate_content_config
+            else types.GenerateContentConfig()
+        )
+
+      # Check if we should stop AFC loop based on config
+      if _should_stop_afc_loop(llm_request, invocation_context, last_event):
         break
 
   async def _run_one_step_async(
@@ -560,6 +673,16 @@ class BaseLlmFlow(ABC):
         ):
           return
 
+      # Check if AFC should be disabled - skip function call execution
+      if _should_stop_afc_loop(
+          llm_request,
+          invocation_context,
+          model_response_event,
+          count_current_event=True,
+      ):
+        # AFC is disabled or limit reached - don't execute function calls
+        return
+
       async with Aclosing(
           self._postprocess_handle_function_calls_async(
               invocation_context, model_response_event, llm_request
@@ -643,6 +766,16 @@ class BaseLlmFlow(ABC):
 
     # Handles function calls.
     if model_response_event.get_function_calls():
+      # Check if AFC should be disabled - skip function call execution
+      if _should_stop_afc_loop(
+          llm_request,
+          invocation_context,
+          model_response_event,
+          count_current_event=True,
+      ):
+        # AFC is disabled or limit reached - don't execute function calls
+        return
+
       function_response_event = await functions.handle_function_calls_live(
           invocation_context, model_response_event, llm_request.tools_dict
       )
