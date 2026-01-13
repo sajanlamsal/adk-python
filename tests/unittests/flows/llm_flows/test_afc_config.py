@@ -18,8 +18,10 @@ Tests for Bug #4133: Ensure that AFC config (disable=True, maximum_remote_calls)
 is properly respected and that planner hooks are always called.
 """
 
+import asyncio
 from unittest.mock import MagicMock
 
+from google.adk.agents.live_request_queue import LiveRequestQueue
 from google.adk.agents.llm_agent import Agent
 from google.adk.models.llm_response import LlmResponse
 from google.adk.planners.built_in_planner import BuiltInPlanner
@@ -28,6 +30,55 @@ from google.genai.types import Part
 import pytest
 
 from ... import testing_utils
+
+
+@pytest.fixture
+def live_test_runner():
+  """Fixture that creates a CustomTestRunner for live mode tests.
+
+  This eliminates code duplication across live mode tests by providing
+  a reusable runner factory that handles live streaming response collection.
+  """
+
+  class CustomTestRunner(testing_utils.InMemoryRunner):
+    """Custom test runner for live mode tests with configurable response collection."""
+
+    def run_live(
+        self,
+        live_request_queue: LiveRequestQueue,
+        run_config: testing_utils.RunConfig = None,
+        max_responses: int = 3,
+    ) -> list[testing_utils.Event]:
+      collected_responses = []
+
+      async def consume_responses(session: testing_utils.Session):
+        run_res = self.runner.run_live(
+            session=session,
+            live_request_queue=live_request_queue,
+            run_config=run_config or testing_utils.RunConfig(),
+        )
+
+        async for response in run_res:
+          collected_responses.append(response)
+          if len(collected_responses) >= max_responses:
+            return
+
+      try:
+        session = self.session
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+          loop.run_until_complete(
+              asyncio.wait_for(consume_responses(session), timeout=5.0)
+          )
+        finally:
+          loop.close()
+      except (asyncio.TimeoutError, asyncio.CancelledError):
+        pass
+
+      return collected_responses
+
+  return CustomTestRunner
 
 
 @pytest.mark.asyncio
@@ -518,11 +569,8 @@ def test_corrupted_session_empty_events():
   assert call_count == 1, 'Tool should be called once even with empty session'
 
 
-def test_afc_disabled_in_live_mode():
+def test_afc_disabled_in_live_mode(live_test_runner):
   """Test that AFC disabled works in live streaming mode."""
-  import asyncio
-
-  from google.adk.agents.live_request_queue import LiveRequestQueue
   from google.genai import types as genai_types
 
   tool_call = types.Part.from_function_call(name='test_tool', args={'x': 1})
@@ -558,44 +606,7 @@ def test_afc_disabled_in_live_mode():
       ),
   )
 
-  class CustomTestRunner(testing_utils.InMemoryRunner):
-
-    def run_live(
-        self,
-        live_request_queue: LiveRequestQueue,
-        run_config: testing_utils.RunConfig = None,
-    ) -> list[testing_utils.Event]:
-      collected_responses = []
-
-      async def consume_responses(session: testing_utils.Session):
-        run_res = self.runner.run_live(
-            session=session,
-            live_request_queue=live_request_queue,
-            run_config=run_config or testing_utils.RunConfig(),
-        )
-
-        async for response in run_res:
-          collected_responses.append(response)
-          # Collect events until turn completion
-          if len(collected_responses) >= 3:
-            return
-
-      try:
-        session = self.session
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-          loop.run_until_complete(
-              asyncio.wait_for(consume_responses(session), timeout=5.0)
-          )
-        finally:
-          loop.close()
-      except (asyncio.TimeoutError, asyncio.CancelledError):
-        pass
-
-      return collected_responses
-
-  runner = CustomTestRunner(root_agent=agent, response_modalities=['AUDIO'])
+  runner = live_test_runner(root_agent=agent, response_modalities=['AUDIO'])
   live_request_queue = LiveRequestQueue()
   live_request_queue.send_realtime(
       blob=genai_types.Blob(data=b'test audio', mime_type='audio/pcm')
@@ -613,11 +624,8 @@ def test_afc_disabled_in_live_mode():
   ), 'Should make 1 LLM call when AFC disabled in live mode'
 
 
-def test_maximum_remote_calls_in_live_mode():
+def test_maximum_remote_calls_in_live_mode(live_test_runner):
   """Test that maximum_remote_calls limit works in live streaming mode."""
-  import asyncio
-
-  from google.adk.agents.live_request_queue import LiveRequestQueue
   from google.genai import types as genai_types
 
   tool_call = types.Part.from_function_call(name='test_tool', args={'x': 1})
@@ -657,49 +665,13 @@ def test_maximum_remote_calls_in_live_mode():
       ),
   )
 
-  class CustomTestRunner(testing_utils.InMemoryRunner):
-
-    def run_live(
-        self,
-        live_request_queue: LiveRequestQueue,
-        run_config: testing_utils.RunConfig = None,
-    ) -> list[testing_utils.Event]:
-      collected_responses = []
-
-      async def consume_responses(session: testing_utils.Session):
-        run_res = self.runner.run_live(
-            session=session,
-            live_request_queue=live_request_queue,
-            run_config=run_config or testing_utils.RunConfig(),
-        )
-
-        async for response in run_res:
-          collected_responses.append(response)
-          if len(collected_responses) >= 4:
-            return
-
-      try:
-        session = self.session
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-          loop.run_until_complete(
-              asyncio.wait_for(consume_responses(session), timeout=5.0)
-          )
-        finally:
-          loop.close()
-      except (asyncio.TimeoutError, asyncio.CancelledError):
-        pass
-
-      return collected_responses
-
-  runner = CustomTestRunner(root_agent=agent, response_modalities=['AUDIO'])
+  runner = live_test_runner(root_agent=agent, response_modalities=['AUDIO'])
   live_request_queue = LiveRequestQueue()
   live_request_queue.send_realtime(
       blob=genai_types.Blob(data=b'test audio', mime_type='audio/pcm')
   )
 
-  res_events = runner.run_live(live_request_queue)
+  res_events = runner.run_live(live_request_queue, max_responses=4)
 
   # Tool should be called exactly once due to limit
   assert (
@@ -712,11 +684,8 @@ def test_maximum_remote_calls_in_live_mode():
   ), 'Should make at least 1 LLM call with maximum_remote_calls=1 in live mode'
 
 
-def test_maximum_remote_calls_zero_in_live_mode():
+def test_maximum_remote_calls_zero_in_live_mode(live_test_runner):
   """Test that maximum_remote_calls=0 stops FCs in live streaming mode."""
-  import asyncio
-
-  from google.adk.agents.live_request_queue import LiveRequestQueue
   from google.genai import types as genai_types
 
   tool_call = types.Part.from_function_call(name='test_tool', args={'x': 1})
@@ -752,43 +721,7 @@ def test_maximum_remote_calls_zero_in_live_mode():
       ),
   )
 
-  class CustomTestRunner(testing_utils.InMemoryRunner):
-
-    def run_live(
-        self,
-        live_request_queue: LiveRequestQueue,
-        run_config: testing_utils.RunConfig = None,
-    ) -> list[testing_utils.Event]:
-      collected_responses = []
-
-      async def consume_responses(session: testing_utils.Session):
-        run_res = self.runner.run_live(
-            session=session,
-            live_request_queue=live_request_queue,
-            run_config=run_config or testing_utils.RunConfig(),
-        )
-
-        async for response in run_res:
-          collected_responses.append(response)
-          if len(collected_responses) >= 3:
-            return
-
-      try:
-        session = self.session
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-          loop.run_until_complete(
-              asyncio.wait_for(consume_responses(session), timeout=5.0)
-          )
-        finally:
-          loop.close()
-      except (asyncio.TimeoutError, asyncio.CancelledError):
-        pass
-
-      return collected_responses
-
-  runner = CustomTestRunner(root_agent=agent, response_modalities=['AUDIO'])
+  runner = live_test_runner(root_agent=agent, response_modalities=['AUDIO'])
   live_request_queue = LiveRequestQueue()
   live_request_queue.send_realtime(
       blob=genai_types.Blob(data=b'test audio', mime_type='audio/pcm')
@@ -805,11 +738,8 @@ def test_maximum_remote_calls_zero_in_live_mode():
   ), 'Should make 1 LLM call when maximum_remote_calls=0 in live mode'
 
 
-def test_parallel_function_calls_in_live_mode():
+def test_parallel_function_calls_in_live_mode(live_test_runner):
   """Test that parallel FCs count as 1 event in live mode."""
-  import asyncio
-
-  from google.adk.agents.live_request_queue import LiveRequestQueue
   from google.genai import types as genai_types
 
   # Create response with 3 parallel function calls
@@ -851,49 +781,13 @@ def test_parallel_function_calls_in_live_mode():
       ),
   )
 
-  class CustomTestRunner(testing_utils.InMemoryRunner):
-
-    def run_live(
-        self,
-        live_request_queue: LiveRequestQueue,
-        run_config: testing_utils.RunConfig = None,
-    ) -> list[testing_utils.Event]:
-      collected_responses = []
-
-      async def consume_responses(session: testing_utils.Session):
-        run_res = self.runner.run_live(
-            session=session,
-            live_request_queue=live_request_queue,
-            run_config=run_config or testing_utils.RunConfig(),
-        )
-
-        async for response in run_res:
-          collected_responses.append(response)
-          if len(collected_responses) >= 4:
-            return
-
-      try:
-        session = self.session
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-          loop.run_until_complete(
-              asyncio.wait_for(consume_responses(session), timeout=5.0)
-          )
-        finally:
-          loop.close()
-      except (asyncio.TimeoutError, asyncio.CancelledError):
-        pass
-
-      return collected_responses
-
-  runner = CustomTestRunner(root_agent=agent, response_modalities=['AUDIO'])
+  runner = live_test_runner(root_agent=agent, response_modalities=['AUDIO'])
   live_request_queue = LiveRequestQueue()
   live_request_queue.send_realtime(
       blob=genai_types.Blob(data=b'test audio', mime_type='audio/pcm')
   )
 
-  res_events = runner.run_live(live_request_queue)
+  res_events = runner.run_live(live_request_queue, max_responses=4)
 
   # All 3 parallel function calls should execute (they count as 1 event)
   assert (
@@ -905,11 +799,8 @@ def test_parallel_function_calls_in_live_mode():
   ), 'Should make at least 1 LLM call with parallel FCs in live mode'
 
 
-def test_negative_maximum_remote_calls_in_live_mode():
+def test_negative_maximum_remote_calls_in_live_mode(live_test_runner):
   """Test that negative maximum_remote_calls is treated as zero in live mode."""
-  import asyncio
-
-  from google.adk.agents.live_request_queue import LiveRequestQueue
   from google.genai import types as genai_types
 
   tool_call = types.Part.from_function_call(name='test_tool', args={'x': 1})
@@ -945,43 +836,7 @@ def test_negative_maximum_remote_calls_in_live_mode():
       ),
   )
 
-  class CustomTestRunner(testing_utils.InMemoryRunner):
-
-    def run_live(
-        self,
-        live_request_queue: LiveRequestQueue,
-        run_config: testing_utils.RunConfig = None,
-    ) -> list[testing_utils.Event]:
-      collected_responses = []
-
-      async def consume_responses(session: testing_utils.Session):
-        run_res = self.runner.run_live(
-            session=session,
-            live_request_queue=live_request_queue,
-            run_config=run_config or testing_utils.RunConfig(),
-        )
-
-        async for response in run_res:
-          collected_responses.append(response)
-          if len(collected_responses) >= 3:
-            return
-
-      try:
-        session = self.session
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-          loop.run_until_complete(
-              asyncio.wait_for(consume_responses(session), timeout=5.0)
-          )
-        finally:
-          loop.close()
-      except (asyncio.TimeoutError, asyncio.CancelledError):
-        pass
-
-      return collected_responses
-
-  runner = CustomTestRunner(root_agent=agent, response_modalities=['AUDIO'])
+  runner = live_test_runner(root_agent=agent, response_modalities=['AUDIO'])
   live_request_queue = LiveRequestQueue()
   live_request_queue.send_realtime(
       blob=genai_types.Blob(data=b'test audio', mime_type='audio/pcm')
@@ -998,11 +853,8 @@ def test_negative_maximum_remote_calls_in_live_mode():
   ), 'Should make 1 LLM call when negative maximum_remote_calls in live mode'
 
 
-def test_maximum_remote_calls_two_in_live_mode():
+def test_maximum_remote_calls_two_in_live_mode(live_test_runner):
   """Test that maximum_remote_calls=2 enforces limit in live mode."""
-  import asyncio
-
-  from google.adk.agents.live_request_queue import LiveRequestQueue
   from google.genai import types as genai_types
 
   tool_call = types.Part.from_function_call(name='test_tool', args={'x': 1})
@@ -1042,49 +894,13 @@ def test_maximum_remote_calls_two_in_live_mode():
       ),
   )
 
-  class CustomTestRunner(testing_utils.InMemoryRunner):
-
-    def run_live(
-        self,
-        live_request_queue: LiveRequestQueue,
-        run_config: testing_utils.RunConfig = None,
-    ) -> list[testing_utils.Event]:
-      collected_responses = []
-
-      async def consume_responses(session: testing_utils.Session):
-        run_res = self.runner.run_live(
-            session=session,
-            live_request_queue=live_request_queue,
-            run_config=run_config or testing_utils.RunConfig(),
-        )
-
-        async for response in run_res:
-          collected_responses.append(response)
-          if len(collected_responses) >= 5:
-            return
-
-      try:
-        session = self.session
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-          loop.run_until_complete(
-              asyncio.wait_for(consume_responses(session), timeout=5.0)
-          )
-        finally:
-          loop.close()
-      except (asyncio.TimeoutError, asyncio.CancelledError):
-        pass
-
-      return collected_responses
-
-  runner = CustomTestRunner(root_agent=agent, response_modalities=['AUDIO'])
+  runner = live_test_runner(root_agent=agent, response_modalities=['AUDIO'])
   live_request_queue = LiveRequestQueue()
   live_request_queue.send_realtime(
       blob=genai_types.Blob(data=b'test audio', mime_type='audio/pcm')
   )
 
-  res_events = runner.run_live(live_request_queue)
+  res_events = runner.run_live(live_request_queue, max_responses=5)
 
   # Tool should be called exactly twice
   assert (
@@ -1095,11 +911,8 @@ def test_maximum_remote_calls_two_in_live_mode():
   ), 'Should make at least 1 LLM call with maximum_remote_calls=2 in live mode'
 
 
-def test_very_large_maximum_remote_calls_in_live_mode():
+def test_very_large_maximum_remote_calls_in_live_mode(live_test_runner):
   """Test that very large maximum_remote_calls works in live mode."""
-  import asyncio
-
-  from google.adk.agents.live_request_queue import LiveRequestQueue
   from google.genai import types as genai_types
 
   tool_call = types.Part.from_function_call(name='test_tool', args={'x': 1})
@@ -1139,49 +952,13 @@ def test_very_large_maximum_remote_calls_in_live_mode():
       ),
   )
 
-  class CustomTestRunner(testing_utils.InMemoryRunner):
-
-    def run_live(
-        self,
-        live_request_queue: LiveRequestQueue,
-        run_config: testing_utils.RunConfig = None,
-    ) -> list[testing_utils.Event]:
-      collected_responses = []
-
-      async def consume_responses(session: testing_utils.Session):
-        run_res = self.runner.run_live(
-            session=session,
-            live_request_queue=live_request_queue,
-            run_config=run_config or testing_utils.RunConfig(),
-        )
-
-        async for response in run_res:
-          collected_responses.append(response)
-          if len(collected_responses) >= 5:
-            return
-
-      try:
-        session = self.session
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-          loop.run_until_complete(
-              asyncio.wait_for(consume_responses(session), timeout=5.0)
-          )
-        finally:
-          loop.close()
-      except (asyncio.TimeoutError, asyncio.CancelledError):
-        pass
-
-      return collected_responses
-
-  runner = CustomTestRunner(root_agent=agent, response_modalities=['AUDIO'])
+  runner = live_test_runner(root_agent=agent, response_modalities=['AUDIO'])
   live_request_queue = LiveRequestQueue()
   live_request_queue.send_realtime(
       blob=genai_types.Blob(data=b'test audio', mime_type='audio/pcm')
   )
 
-  res_events = runner.run_live(live_request_queue)
+  res_events = runner.run_live(live_request_queue, max_responses=5)
 
   # In live mode with timeout, may not get all 3 calls
   # But should get at least 2 calls (verifies large limit works)
@@ -1194,11 +971,8 @@ def test_very_large_maximum_remote_calls_in_live_mode():
   ), 'Should make at least 1 LLM call with very large limit in live mode'
 
 
-def test_corrupted_session_in_live_mode():
+def test_corrupted_session_in_live_mode(live_test_runner):
   """Test behavior when session is corrupted in live mode."""
-  import asyncio
-
-  from google.adk.agents.live_request_queue import LiveRequestQueue
   from google.genai import types as genai_types
 
   tool_call = types.Part.from_function_call(name='test_tool', args={'x': 1})
@@ -1234,46 +1008,9 @@ def test_corrupted_session_in_live_mode():
       ),
   )
 
-  class CustomTestRunner(testing_utils.InMemoryRunner):
-
-    def run_live(
-        self,
-        live_request_queue: LiveRequestQueue,
-        run_config: testing_utils.RunConfig = None,
-    ) -> list[testing_utils.Event]:
-      # Clear session events to simulate corrupted state
-      self.session._events = []
-
-      collected_responses = []
-
-      async def consume_responses(session: testing_utils.Session):
-        run_res = self.runner.run_live(
-            session=session,
-            live_request_queue=live_request_queue,
-            run_config=run_config or testing_utils.RunConfig(),
-        )
-
-        async for response in run_res:
-          collected_responses.append(response)
-          if len(collected_responses) >= 3:
-            return
-
-      try:
-        session = self.session
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-          loop.run_until_complete(
-              asyncio.wait_for(consume_responses(session), timeout=5.0)
-          )
-        finally:
-          loop.close()
-      except (asyncio.TimeoutError, asyncio.CancelledError):
-        pass
-
-      return collected_responses
-
-  runner = CustomTestRunner(root_agent=agent, response_modalities=['AUDIO'])
+  runner = live_test_runner(root_agent=agent, response_modalities=['AUDIO'])
+  # Clear session events to simulate corrupted state
+  runner.session._events = []
   live_request_queue = LiveRequestQueue()
   live_request_queue.send_realtime(
       blob=genai_types.Blob(data=b'test audio', mime_type='audio/pcm')
@@ -1287,11 +1024,8 @@ def test_corrupted_session_in_live_mode():
   ), 'Tool should be called once even with corrupted session in live mode'
 
 
-def test_planner_hooks_in_live_mode():
+def test_planner_hooks_in_live_mode(live_test_runner):
   """Test that maximum_remote_calls=0 works correctly in live mode."""
-  import asyncio
-
-  from google.adk.agents.live_request_queue import LiveRequestQueue
   from google.genai import types as genai_types
 
   tool_call = types.Part.from_function_call(name='test_tool', args={'x': 1})
@@ -1327,43 +1061,7 @@ def test_planner_hooks_in_live_mode():
       ),
   )
 
-  class CustomTestRunner(testing_utils.InMemoryRunner):
-
-    def run_live(
-        self,
-        live_request_queue: LiveRequestQueue,
-        run_config: testing_utils.RunConfig = None,
-    ) -> list[testing_utils.Event]:
-      collected_responses = []
-
-      async def consume_responses(session: testing_utils.Session):
-        run_res = self.runner.run_live(
-            session=session,
-            live_request_queue=live_request_queue,
-            run_config=run_config or testing_utils.RunConfig(),
-        )
-
-        async for response in run_res:
-          collected_responses.append(response)
-          if len(collected_responses) >= 3:
-            return
-
-      try:
-        session = self.session
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-          loop.run_until_complete(
-              asyncio.wait_for(consume_responses(session), timeout=5.0)
-          )
-        finally:
-          loop.close()
-      except (asyncio.TimeoutError, asyncio.CancelledError):
-        pass
-
-      return collected_responses
-
-  runner = CustomTestRunner(root_agent=agent, response_modalities=['AUDIO'])
+  runner = live_test_runner(root_agent=agent, response_modalities=['AUDIO'])
   live_request_queue = LiveRequestQueue()
   live_request_queue.send_realtime(
       blob=genai_types.Blob(data=b'test audio', mime_type='audio/pcm')

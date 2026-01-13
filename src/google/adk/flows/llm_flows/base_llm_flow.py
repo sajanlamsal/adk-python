@@ -106,25 +106,20 @@ def _should_stop_afc_loop(
     NOT individual function executions. An event with multiple parallel function
     calls counts as 1 toward the limit, not N.
   """
+  afc_config = (
+      llm_request.config and llm_request.config.automatic_function_calling
+  )
+  if not afc_config:
+    return False
+
   # Check if AFC is explicitly disabled
-  if (
-      llm_request.config
-      and llm_request.config.automatic_function_calling
-      and llm_request.config.automatic_function_calling.disable
-  ):
+  if afc_config.disable:
     logger.warning('automatic_function_calling is disabled. Stopping AFC loop.')
     return True
 
   # Check maximum_remote_calls limit
-  if (
-      llm_request.config
-      and llm_request.config.automatic_function_calling
-      and llm_request.config.automatic_function_calling.maximum_remote_calls
-      is not None
-  ):
-    max_calls = (
-        llm_request.config.automatic_function_calling.maximum_remote_calls
-    )
+  if afc_config.maximum_remote_calls is not None:
+    max_calls = afc_config.maximum_remote_calls
     if max_calls <= 0:
       logger.warning(
           'max_remote_calls in automatic_function_calling_config %s is less'
