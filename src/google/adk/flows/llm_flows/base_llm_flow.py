@@ -265,7 +265,7 @@ def _should_stop_afc_loop(
         if guardrail_in_progress:
           logger.warning(
               'Guardrail final iteration has FCs (count=%d). '
-              'Breaking after this.',
+              'The outer loop will terminate after this iteration.',
               new_count,
           )
           return False, new_count
